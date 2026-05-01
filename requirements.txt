@@ -1,7 +1,8 @@
 flask
-spacy
-scikit-learn
-nltk
-pymysql
-pdfplumber
+sentence-transformers
+transformers
+torch
+PyPDF2
 python-docx
+langdetect
+duckduckgo-search

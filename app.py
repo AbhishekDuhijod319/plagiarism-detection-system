@@ -10,6 +10,8 @@ from ddgs import DDGS
 import hashlib
 import torch
 
+import re
+
 DetectorFactory.seed = 0  # reproducible language detection
 
 app = Flask(__name__)
@@ -31,12 +33,11 @@ except Exception as e:
     rephrase_model = None
 
 # ===================== Reference Corpus =====================
-reference_texts = [
-    "This is a sample text with plagiarism.",
-    "Another example of copied content.",
-    "Educational content about programming.",
-    "A guide to writing original articles."
-]
+# NOTE: The static reference corpus was removed because vague generic
+# sentences ("sample text", "copied content") caused massive false
+# positives — any text about common topics scored 40-70% plagiarism.
+# Plagiarism is now scored exclusively against live web-scraped sources,
+# which represent actual published content the user might have copied from.
 
 # ===================== SQLite Database =====================
 if not os.path.exists('plagiarism.db'):
@@ -55,31 +56,55 @@ def chunk_text(text, chunk_size=500):
     words = text.split()
     return [" ".join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size)]
 
+def extract_key_sentences(text, max_sentences=3):
+    """Extract the most representative sentences for web search queries.
+    DuckDuckGo works best with short, focused queries (5-15 words),
+    not 400-character blobs of raw text."""
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    # Filter to meaningful sentences (at least 5 words, skip very short ones)
+    meaningful = [s.strip() for s in sentences if len(s.split()) >= 5]
+    return meaningful[:max_sentences] if meaningful else [text[:150]]
+
 def scrape_web_for_similar(text, max_results=5):
-    query_text = text[:400]
-    query_hash = hashlib.md5(query_text.encode()).hexdigest()
-    if query_hash in scrape_cache:
-        return scrape_cache[query_hash]
+    """Search the web using focused key-sentence queries.
+    Returns two parallel lists:
+      - plain_snippets:  clean text for embedding comparison
+      - display_sources: HTML-formatted strings for the UI
+    """
+    key_sentences = extract_key_sentences(text, max_sentences=3)
+    cache_key = hashlib.md5("|".join(key_sentences).encode()).hexdigest()
+    if cache_key in scrape_cache:
+        return scrape_cache[cache_key]
 
     try:
-        results = []
+        plain_snippets = []
+        display_sources = []
+        seen_snippets = set()
         with DDGS() as ddgs:
-            search_results = ddgs.text(query_text, max_results=max_results)
-            for r in search_results:
-                snippet = r.get("body", "")
-                link = r.get("href", "")
-                if snippet and len(snippet) > 50:
-                    try:
-                        if detect(snippet) == 'en':
-                            results.append(f"{snippet} - <a href='{link}' target='_blank'>source</a>")
-                    except:
-                        continue
-        final_results = results if results else ["No relevant content found."]
-        scrape_cache[query_hash] = final_results
-        return final_results
+            for query in key_sentences:
+                search_results = ddgs.text(query, max_results=max_results)
+                for r in search_results:
+                    snippet = r.get("body", "")
+                    link = r.get("href", "")
+                    if snippet and len(snippet) > 50 and snippet not in seen_snippets:
+                        try:
+                            if detect(snippet) == 'en':
+                                seen_snippets.add(snippet)
+                                plain_snippets.append(snippet)
+                                display_sources.append(
+                                    f"{snippet} - <a href='{link}' target='_blank'>source</a>"
+                                )
+                        except:
+                            continue
+        if not plain_snippets:
+            plain_snippets = []
+            display_sources = ["No relevant content found."]
+        result = (plain_snippets, display_sources)
+        scrape_cache[cache_key] = result
+        return result
     except Exception as e:
         print(f"Web scraping error: {e}")
-        return ["Error fetching web content."]
+        return ([], ["Error fetching web content."])
 
 def rephrase_content(text):
     input_text = "paraphrase: " + text + " </s>"
@@ -144,7 +169,7 @@ def do_check():
         language = "unknown"
 
     # ----------- Scrape web for similar content -----------
-    scraped_content = scrape_web_for_similar(text)
+    plain_snippets, display_sources = scrape_web_for_similar(text)
 
     # ----------- Chunk text for long documents -----------
     text_chunks = chunk_text(text)
@@ -154,23 +179,52 @@ def do_check():
         return jsonify({'error': 'Plagiarism model not loaded'}), 500
 
     try:
-        user_embeddings = [plagiarism_model.encode(chunk, convert_to_tensor=True) for chunk in text_chunks]
-        reference_embeddings = plagiarism_model.encode(reference_texts + scraped_content, convert_to_tensor=True)
-        cosine_scores = [util.pytorch_cos_sim(ue, reference_embeddings)[0] for ue in user_embeddings]
-        plagiarism_score = max([cs.max().item() for cs in cosine_scores]) * 100
+        if plain_snippets:
+            user_embeddings = [plagiarism_model.encode(chunk, convert_to_tensor=True) for chunk in text_chunks]
+            # Encode only clean text (no HTML) for accurate similarity
+            reference_embeddings = plagiarism_model.encode(plain_snippets, convert_to_tensor=True)
+            cosine_scores = [util.pytorch_cos_sim(ue, reference_embeddings)[0] for ue in user_embeddings]
+
+            # Weighted average: each chunk's best match, weighted by chunk word-count.
+            # This prevents a single similar sentence from inflating the entire score.
+            chunk_best_scores = [cs.max().item() for cs in cosine_scores]
+            chunk_weights = [len(chunk.split()) for chunk in text_chunks]
+            total_weight = sum(chunk_weights)
+            plagiarism_score = (
+                sum(s * w for s, w in zip(chunk_best_scores, chunk_weights)) / total_weight
+            ) * 100
+        else:
+            # No web sources found — cannot determine plagiarism from web
+            plagiarism_score = 0.0
     except Exception as e:
         print(f"Plagiarism check error: {e}")
         return jsonify({'error': 'Failed to calculate plagiarism score'}), 500
 
-    # ----------- AI content detection (first chunk) -----------
+    # ----------- AI content detection (all chunks) -----------
     if ai_detector is None:
         return jsonify({'error': 'AI detector not loaded'}), 500
 
     try:
-        truncated_text = text_chunks[0][:512]
-        ai_result = ai_detector(truncated_text)[0]
-        is_ai_generated = ai_result['label'].lower() == 'ai-generated' and ai_result['score'] > 0.7
-        ai_confidence = ai_result['score'] * 100
+        # roberta-large-openai-detector labels:
+        #   LABEL_0 = Real (human-written)
+        #   LABEL_1 = Fake (AI-generated)
+        # Analyze ALL chunks so long documents aren't judged by the intro alone.
+        chunk_ai_probs = []
+        for chunk in text_chunks:
+            truncated = chunk[:512]  # model max token window
+            result = ai_detector(truncated)[0]
+            if result['label'] == 'LABEL_1':  # Fake / AI
+                chunk_ai_probs.append(result['score'])
+            else:  # LABEL_0 = Real → invert to get P(AI)
+                chunk_ai_probs.append(1.0 - result['score'])
+
+        # Weighted average across chunks (by word count)
+        chunk_weights = [len(chunk.split()) for chunk in text_chunks]
+        total_weight = sum(chunk_weights)
+        avg_ai_prob = sum(p * w for p, w in zip(chunk_ai_probs, chunk_weights)) / total_weight
+
+        ai_confidence = round(avg_ai_prob * 100, 2)
+        is_ai_generated = avg_ai_prob > 0.7
     except Exception as e:
         print(f"AI detection error: {e}")
         is_ai_generated = False
@@ -203,7 +257,7 @@ def do_check():
         'ai_confidence': round(ai_confidence, 2),
         'language': language,
         'rephrased': rephrased,
-        'scraped_sources': scraped_content
+        'scraped_sources': display_sources
     })
 
 
